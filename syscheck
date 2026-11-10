@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# syscheck - one-shot Linux server health check.
+# Pure bash + coreutils/procps; tested target: CentOS 7 (bash 4.2, kernel 3.10).
+
+set -o pipefail
+export LC_ALL=C
+
+VERSION="1.0.0"
+ALL_SECTIONS="system cpu mem disk net svc sec proc"
+
+WARN_PCT=${SYSCHECK_WARN:-80}
+CRIT_PCT=${SYSCHECK_CRIT:-90}
+
+WARN_COUNT=0
+CRIT_COUNT=0
+USE_COLOR=1
+QUIET=0
+
+usage() {
+    cat <<EOF
+syscheck $VERSION - Linux server health check
+
+Usage: syscheck [options] [section...]
+
+Sections (default: all):
+  system   OS, kernel, uptime
+  cpu      CPU model, usage, load average
+  mem      memory and swap
+  disk     filesystem space and inode usage
+  net      listening ports, connection counts
+  svc      failed systemd services
+  sec      SELinux, firewall, SSH, failed logins
+  proc     top processes by CPU and memory
+
+Options:
+  -q, --quiet       only print WARN/CRIT lines and the summary
+  -n, --no-color    disable colored output
+  -w, --warn N      warning threshold in percent (default $WARN_PCT)
+  -c, --crit N      critical threshold in percent (default $CRIT_PCT)
+  -v, --version     print version
+  -h, --help        show this help
+
+Exit codes: 0 = all OK, 1 = warnings, 2 = critical issues.
+EOF
+}
+
+setup_colors() {
+    if [ "$USE_COLOR" -eq 1 ] && [ -t 1 ]; then
+        C_RED=$'\e[31m'; C_YEL=$'\e[33m'; C_GRN=$'\e[32m'
+        C_CYN=$'\e[36m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+    else
+        C_RED=""; C_YEL=""; C_GRN=""; C_CYN=""; C_BLD=""; C_RST=""
+    fi
+}
+
+header() {
+    [ "$QUIET" -eq 1 ] && return
+    printf '\n%s== %s ==%s\n' "$C_BLD$C_CYN" "$1" "$C_RST"
+}
+
+info() {
+    [ "$QUIET" -eq 1 ] && return
+    printf '  %-22s %s\n' "$1" "$2"
+}
+
+ok() {
+    [ "$QUIET" -eq 1 ] && return
+    printf '  %s[ OK ]%s %s\n' "$C_GRN" "$C_RST" "$1"
+}
+
+warn() {
+    WARN_COUNT=$((WARN_COUNT + 1))
+    printf '  %s[WARN]%s %s\n' "$C_YEL" "$C_RST" "$1"
+}
+
+crit() {
+    CRIT_COUNT=$((CRIT_COUNT + 1))
+    printf '  %s[CRIT]%s %s\n' "$C_RED" "$C_RST" "$1"
+}
+
+# Grades an integer percentage against the thresholds.
+grade_pct() {
+    local pct=$1 msg=$2
+    if [ "$pct" -ge "$CRIT_PCT" ]; then
+        crit "$msg"
+    elif [ "$pct" -ge "$WARN_PCT" ]; then
+        warn "$msg"
+    else
+        ok "$msg"
+    fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+human_kb() {
+    awk -v kb="$1" 'BEGIN {
+        split("KB MB GB TB", u, " "); i = 1; v = kb
+        while (v >= 1024 && i < 4) { v /= 1024; i++ }
+        printf "%.1f %s", v, u[i]
+    }'
+}
+
+check_system() {
+    header "System"
+    local os="unknown"
+    if [ -r /etc/redhat-release ]; then
+        os=$(cat /etc/redhat-release)
+    elif [ -r /etc/os-release ]; then
+        os=$(. /etc/os-release && echo "$PRETTY_NAME")
+    fi
+    local up_sec
+    up_sec=$(cut -d. -f1 /proc/uptime)
+    info "Hostname" "$(hostname)"
+    info "OS" "$os"
+    info "Kernel" "$(uname -r) ($(uname -m))"
+    info "Uptime" "$((up_sec / 86400))d $((up_sec % 86400 / 3600))h $((up_sec % 3600 / 60))m"
+    info "Logged-in users" "$(who 2>/dev/null | wc -l)"
+    info "Time" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+}
+
+read_cpu_ticks() {
+    awk '/^cpu / { idle = $5 + $6; total = 0; for (i = 2; i <= NF; i++) total += $i; print idle, total }' /proc/stat
+}
+
+check_cpu() {
+    header "CPU"
+    local cores model
+    cores=$(grep -c '^processor' /proc/cpuinfo)
+    model=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)
+    info "Model" "${model:-unknown}"
+    info "Logical cores" "$cores"
+
+    local i1 t1 i2 t2 usage
+    read -r i1 t1 < <(read_cpu_ticks)
+    sleep 1
+    read -r i2 t2 < <(read_cpu_ticks)
+    if [ $((t2 - t1)) -gt 0 ]; then
+        usage=$(( (100 * ((t2 - t1) - (i2 - i1))) / (t2 - t1) ))
+    else
+        usage=0
+    fi
+    grade_pct "$usage" "CPU usage ${usage}% (1s sample)"
+
+    local l1 l5 l15
+    read -r l1 l5 l15 _ < /proc/loadavg
+    local per_core
+    per_core=$(awk -v l="$l5" -v c="$cores" 'BEGIN { printf "%d", (l / c) * 100 }')
+    grade_pct "$per_core" "Load average $l1 / $l5 / $l15 (5-min load = ${per_core}% of $cores cores)"
+}
+
+check_mem() {
+    header "Memory"
+    local total avail swap_total swap_free
+    eval "$(awk '
+        /^MemTotal:/     { t = $2 }
+        /^MemAvailable:/ { a = $2 }
+        /^MemFree:/      { f = $2 }
+        /^Buffers:/      { b = $2 }
+        /^Cached:/       { c = $2 }
+        /^SwapTotal:/    { st = $2 }
+        /^SwapFree:/     { sf = $2 }
+        END {
+            if (a == "") a = f + b + c
+            printf "total=%d avail=%d swap_total=%d swap_free=%d\n", t, a, st, sf
+        }' /proc/meminfo)"
+
+    local used=$((total - avail))
+    local pct=$((100 * used / total))
+    grade_pct "$pct" "RAM $(human_kb "$used") used of $(human_kb "$total") (${pct}%)"
+
+    if [ "$swap_total" -gt 0 ]; then
+        local swap_used=$((swap_total - swap_free))
+        local spct=$((100 * swap_used / swap_total))
+        grade_pct "$spct" "Swap $(human_kb "$swap_used") used of $(human_kb "$swap_total") (${spct}%)"
+    else
+        info "Swap" "not configured"
+    fi
+}
+
+# Prints df -P rows as tab-separated "fs size used pct mount"; device and
+# mount names may contain spaces, so columns are located by the capacity field.
+df_rows() {
+    df -P "$@" -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR > 1 {
+        for (i = NF; i >= 5; i--) {
+            if ($i ~ /^([0-9]+%|-)$/ && $(i-1) ~ /^[0-9-]+$/ && $(i-2) ~ /^[0-9-]+$/ && $(i-3) ~ /^[0-9-]+$/) {
+                fs = $1; for (j = 2; j <= i - 4; j++) fs = fs " " $j
+                mnt = $(i+1); for (j = i + 2; j <= NF; j++) mnt = mnt " " $j
+                printf "%s\t%s\t%s\t%s\t%s\n", fs, $(i-3), $(i-2), $i, mnt
+                break
+            }
+        }
+    }'
+}
+
+check_disk() {
+    header "Disk"
+    local fs size used pct mount
+    while IFS=$'\t' read -r fs size used pct mount; do
+        pct=${pct%\%}
+        [ "$pct" = "-" ] && continue
+        grade_pct "$pct" "$(printf '%-20s %3s%% used  (%s of %s)  %s' "$mount" "$pct" "$(human_kb "$used")" "$(human_kb "$size")" "$fs")"
+    done < <(df_rows -k)
+
+    while IFS=$'\t' read -r _ _ _ pct mount; do
+        pct=${pct%\%}
+        [ "$pct" = "-" ] && continue
+        [ "$pct" -ge "$WARN_PCT" ] && grade_pct "$pct" "Inodes on $mount ${pct}% used"
+    done < <(df_rows -i)
+}
+
+check_net() {
+    header "Network"
+    local ips
+    ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{ printf "%s(%s) ", $4, $2 }')
+    info "IPv4 addresses" "${ips:-none}"
+
+    if have ss; then
+        info "Established TCP" "$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)"
+        info "TIME-WAIT TCP" "$(ss -tn state time-wait 2>/dev/null | tail -n +2 | wc -l)"
+        [ "$QUIET" -eq 1 ] && return
+        echo "  Listening ports:"
+        ss -tulnp 2>/dev/null | awk 'NR > 1 {
+            proc = $7; sub(/^users:\(\("/, "", proc); sub(/".*/, "", proc)
+            printf "    %-5s %-28s %s\n", $1, $5, proc
+        }' | sort -u
+    elif have netstat; then
+        [ "$QUIET" -eq 1 ] && return
+        echo "  Listening ports:"
+        netstat -tulnp 2>/dev/null | awk '/LISTEN|^udp/ { printf "    %-5s %-28s %s\n", $1, $4, $NF }'
+    else
+        info "Ports" "neither ss nor netstat available"
+    fi
+}
+
+check_svc() {
+    header "Services"
+    if ! have systemctl; then
+        info "systemd" "not available"
+        return
+    fi
+    local failed
+    failed=$(systemctl --failed --no-legend 2>/dev/null \
+        | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\./) { print $i; break } }')
+    if [ -n "$failed" ]; then
+        local unit
+        for unit in $failed; do
+            crit "Failed unit: $unit"
+        done
+    else
+        ok "No failed systemd units"
+    fi
+}
+
+check_sec() {
+    header "Security"
+    if have getenforce; then
+        info "SELinux" "$(getenforce 2>/dev/null)"
+    fi
+
+    if have firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1; then
+        ok "firewalld is running"
+    elif have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        ok "ufw is active"
+    else
+        warn "No active firewall (firewalld/ufw) detected"
+    fi
+
+    local sshd=/etc/ssh/sshd_config
+    if [ -r "$sshd" ]; then
+        local root_login pass_auth
+        root_login=$(awk 'tolower($1) == "permitrootlogin" { v = $2 } END { print v }' "$sshd")
+        pass_auth=$(awk 'tolower($1) == "passwordauthentication" { v = $2 } END { print v }' "$sshd")
+        if [ "${root_login:-yes}" = "yes" ]; then
+            warn "SSH: PermitRootLogin is ${root_login:-yes (default)}"
+        else
+            ok "SSH: PermitRootLogin $root_login"
+        fi
+        info "SSH password auth" "${pass_auth:-yes (default)}"
+    fi
+
+    local log=""
+    [ -r /var/log/secure ] && log=/var/log/secure
+    [ -z "$log" ] && [ -r /var/log/auth.log ] && log=/var/log/auth.log
+    if [ -n "$log" ]; then
+        local fails
+        fails=$(grep -c 'Failed password' "$log" 2>/dev/null)
+        if [ "${fails:-0}" -ge 100 ]; then
+            warn "$fails failed SSH password attempts in $log"
+            [ "$QUIET" -eq 1 ] || grep 'Failed password' "$log" | grep -oE 'from [0-9.]+' \
+                | awk '{ print $2 }' | sort | uniq -c | sort -rn | head -5 \
+                | awk '{ printf "         %6d  %s\n", $1, $2 }'
+        else
+            ok "${fails:-0} failed SSH password attempts in $log"
+        fi
+    else
+        info "Auth log" "not readable (run as root for login checks)"
+    fi
+}
+
+check_proc() {
+    header "Top processes"
+    local zombies
+    zombies=$(ps -eo stat --no-headers | grep -c '^Z')
+    [ "$zombies" -gt 0 ] && warn "$zombies zombie process(es)"
+    [ "$QUIET" -eq 1 ] && return
+    info "Total processes" "$(ps -e --no-headers | wc -l)"
+    echo "  By CPU:"
+    ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | head -6 | sed 's/^/    /'
+    echo "  By memory:"
+    ps -eo pid,user,%cpu,%mem,comm --sort=-%mem | head -6 | sed 's/^/    /'
+}
+
+main() {
+    local sections=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)     usage; exit 0 ;;
+            -v|--version)  echo "syscheck $VERSION"; exit 0 ;;
+            -q|--quiet)    QUIET=1 ;;
+            -n|--no-color) USE_COLOR=0 ;;
+            -w|--warn)     WARN_PCT=$2; shift ;;
+            -c|--crit)     CRIT_PCT=$2; shift ;;
+            system|cpu|mem|disk|net|svc|sec|proc) sections="$sections $1" ;;
+            *) echo "syscheck: unknown argument '$1'" >&2; usage >&2; exit 64 ;;
+        esac
+        shift
+    done
+
+    case "$WARN_PCT$CRIT_PCT" in
+        *[!0-9]*|"") echo "syscheck: thresholds must be integers" >&2; exit 64 ;;
+    esac
+
+    setup_colors
+    [ -z "$sections" ] && sections=$ALL_SECTIONS
+    [ "$(id -u)" -ne 0 ] && [ "$QUIET" -eq 0 ] && \
+        echo "${C_YEL}Note: not running as root; some checks (ports' process names, auth log) may be incomplete.${C_RST}"
+
+    local s
+    for s in $sections; do
+        "check_$s"
+    done
+
+    printf '\n%sSummary:%s %d critical, %d warning(s)\n' "$C_BLD" "$C_RST" "$CRIT_COUNT" "$WARN_COUNT"
+    if [ "$CRIT_COUNT" -gt 0 ]; then
+        exit 2
+    elif [ "$WARN_COUNT" -gt 0 ]; then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"
